@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StudentFix AI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="hero">
+    <span class="badge">AI STUDENT COMPANION</span>
+    <h1>🎓 StudentFix AI</h1>
+    <p>Check applications, improve resumes, plan careers and practice interviews.</p>
+</header>
+
+<nav class="nav">
+    <button onclick="requestSection('document')">📄 DocumentFix</button>
+    <button onclick="requestSection('resume')">📝 ResumeFix</button>
+    <button onclick="requestSection('career')">🎯 CareerMate</button>
+    <button onclick="requestSection('interview')">🎤 InterviewMate</button>
+    <button onclick="requestSection('history')">🕘 History</button>
+    <span id="userArea" class="user-area"></span>
+</nav>
+
+<main class="container">
+<section id="welcome" class="card welcome-card">
+    <div class="section-icon">🎓</div>
+    <h2>Welcome to StudentFix AI</h2>
+    <p>Choose a tool above. Login is requested when you open a tool so your work can be associated with your account.</p>
+    <div class="welcome-features">
+        <div>📄 <strong>DocumentFix</strong><span>Check required documents and application readiness.</span></div>
+        <div>📝 <strong>ResumeFix</strong><span>Review your resume against a job description.</span></div>
+        <div>🎯 <strong>CareerMate</strong><span>Generate a beginner-friendly career roadmap.</span></div>
+        <div>🎤 <strong>InterviewMate</strong><span>Practice interview questions with AI feedback.</span></div>
+    </div>
+</section>
+
+<!-- =====================================================
+     DOCUMENTFIX: df1 functionality
+     ===================================================== -->
+<section id="document" class="card">
+    <div class="section-title">
+        <span class="section-icon">📄</span>
+        <div>
+            <h2>DocumentFix</h2>
+            <p>Check an application before you submit it.</p>
+        </div>
+    </div>
+
+    <div class="step">
+        <div class="step-number">1</div>
+        <div class="step-content">
+            <h3>Select application type</h3>
+            <select id="applicationType">
+                <option value="">Select application type</option>
+                <option>Scholarship</option>
+                <option>College Admission</option>
+                <option>Government Scheme</option>
+                <option>Internship</option>
+                <option>Certificate Application</option>
+            </select>
+        </div>
+    </div>
+
+    <div class="step">
+        <div class="step-number">2</div>
+        <div class="step-content">
+            <h3>Upload Requirements</h3>
+            <p>Upload the official requirements PDF.</p>
+            <label class="upload-box">
+                <input type="file" id="requirementsFile" accept=".pdf">
+                <span class="upload-icon">📄</span>
+                <strong>Choose Requirements PDF</strong>
+                <small>PDF files only</small>
+            </label>
+            <button id="analyzeButton" class="primary">🧠 Understand Requirements</button>
+            <div id="requirementsLoading" class="loading hidden">Analyzing requirements...</div>
+
+            <div id="requirementsResult" class="result-panel hidden">
+                <h3>🧠 Requirement Intelligence</h3>
+                <h4>📄 Required Documents</h4>
+                <ul id="requiredDocuments"></ul>
+                <h4>🎯 Eligibility Keywords</h4>
+                <div id="eligibility" class="chips"></div>
+                <h4>📋 Important Conditions</h4>
+                <ul id="conditions"></ul>
+                <h4>📅 Deadline</h4>
+                <p id="deadline">Not detected</p>
+            </div>
+        </div>
+    </div>
+
+    <div class="step">
+        <div class="step-number">3</div>
+        <div class="step-content">
+            <h3>Upload Your Documents</h3>
+            <p>Upload the documents you plan to submit.</p>
+            <label class="upload-box">
+                <input type="file" id="documents" multiple accept=".pdf,.jpg,.jpeg,.png">
+                <span class="upload-icon">📁</span>
+                <strong>Choose Documents</strong>
+                <small>PDF, JPG or PNG</small>
+            </label>
+            <div id="selectedFiles" class="file-list"></div>
+
+            <div class="personal-info">
+                <h3>Optional Application Information</h3>
+                <input type="text" id="applicationName" placeholder="Applicant full name">
+                <input type="text" id="applicationDob" placeholder="Date of Birth (DD/MM/YYYY)">
+            </div>
+
+            <button id="checkButton" class="primary">🔍 Check My Documents</button>
+            <div id="checkLoading" class="loading hidden">Checking your application...</div>
+        </div>
+    </div>
+
+    <section id="dashboard" class="dashboard hidden">
+        <h2>📊 Application Readiness</h2>
+
+        <div class="score-card">
+            <div id="score" class="score">0%</div>
+            <div>
+                <h3 id="status">Checking...</h3>
+                <p>Estimated readiness only — not guaranteed approval.</p>
+            </div>
+        </div>
+
+        <div class="summary-grid">
+            <div class="summary">
+                <strong id="uploadedCount">0</strong>
+                <span>Documents Uploaded</span>
+            </div>
+            <div class="summary">
+                <strong id="missingCount">0</strong>
+                <span>Missing</span>
+            </div>
+            <div class="summary">
+                <strong id="mismatchCount">0</strong>
+                <span>Needs Verification</span>
+            </div>
+        </div>
+
+        <div id="highPrioritySection" class="issue-section hidden">
+            <h3>🔴 High Priority</h3>
+            <ul id="highPriority"></ul>
+        </div>
+
+        <div id="mediumPrioritySection" class="issue-section hidden">
+            <h3>🟡 Needs Verification</h3>
+            <ul id="mediumPriority"></ul>
+        </div>
+
+        <div id="lowPrioritySection" class="issue-section hidden">
+            <h3>🔵 Format Issues</h3>
+            <ul id="lowPriority"></ul>
+        </div>
+
+        <div class="fix-card">
+            <h3>🛠️ Fix My Application</h3>
+            <p>Complete these actions before submitting.</p>
+            <ul id="fixes"></ul>
+        </div>
+
+        <div id="finalMessage" class="final-message"></div>
+    </section>
+</section>
+
+<!-- =====================================================
+     RESUMEFIX: StudentFix functionality
+     ===================================================== -->
+<section id="resume" class="card hidden">
+    <h2>📝 ResumeFix</h2>
+    <p>Get an AI review of your resume against a job description.</p>
+
+    <label>Resume</label>
+    <input type="file" id="resumeFile" accept=".pdf,.txt,.docx">
+
+    <label>Job description</label>
+    <textarea id="job" placeholder="Paste the job description here..."></textarea>
+
+    <button class="primary" onclick="resumeFix()">Analyze Resume</button>
+    <div id="resumeResult" class="result"></div>
+</section>
+
+<!-- =====================================================
+     CAREERMATE: StudentFix functionality
+     ===================================================== -->
+<section id="career" class="card hidden">
+    <h2>🎯 CareerMate</h2>
+    <p>Create a simple roadmap based on your goal and current skills.</p>
+
+    <label>Career goal</label>
+    <input id="goal" placeholder="Example: Python Developer">
+
+    <label>Current skills</label>
+    <textarea id="skills" placeholder="Example: Python basics, SQL, HTML, CSS..."></textarea>
+
+    <button class="primary" onclick="careerMate()">Generate Roadmap</button>
+    <div id="careerResult" class="result"></div>
+</section>
+
+<!-- =====================================================
+     INTERVIEWMATE: StudentFix functionality
+     ===================================================== -->
+<section id="interview" class="card hidden">
+    <h2>🎤 InterviewMate</h2>
+    <p>Practice one question at a time and get AI feedback.</p>
+
+    <label>Target role</label>
+    <input id="role" placeholder="Example: Python Developer">
+
+    <button class="primary" onclick="getQuestion()">Start Interview</button>
+
+    <div id="questionBox" class="question hidden">
+        <strong>Question:</strong>
+        <div id="question"></div>
+        <label>Your answer</label>
+        <textarea id="answer" placeholder="Type your answer here..."></textarea>
+        <button class="primary" onclick="evaluateAnswer()">Evaluate Answer</button>
+    </div>
+
+    <div id="interviewResult" class="result"></div>
+</section>
+
+<!-- =====================================================
+     HISTORY: StudentFix functionality
+     ===================================================== -->
+<section id="history" class="card hidden">
+    <h2>🕘 History</h2>
+    <p>Your latest analyses are saved in the local SQLite database.</p>
+    <button class="primary" onclick="loadHistory()">Refresh History</button>
+    <div id="historyResult"></div>
+</section>
+
+</main>
+
+<div id="authModal" class="modal hidden" aria-hidden="true">
+  <div class="modal-card">
+    <button class="modal-close" onclick="closeAuthModal()" aria-label="Close">×</button>
+    <div class="auth-brand">🎓</div>
+    <h2 id="authTitle">Login</h2>
+    <p id="authSubtitle">Login to continue to StudentFix AI.</p>
+
+    <div id="loginForm">
+      <label>Name / Email</label>
+      <input id="loginEmail" type="email" placeholder="Enter your email">
+      <label>Password</label>
+      <input id="loginPassword" type="password" placeholder="Enter your password">
+      <button class="primary auth-button" onclick="loginUser()">Login</button>
+      <button class="text-button" onclick="showRegister()">Create Account</button>
+      <button class="guest-button" onclick="continueAsGuest()">Continue as Guest</button>
+    </div>
+
+    <div id="registerForm" class="hidden">
+      <label>Name</label>
+      <input id="registerName" type="text" placeholder="Your name">
+      <label>Email</label>
+      <input id="registerEmail" type="email" placeholder="Your email">
+      <label>Password</label>
+      <input id="registerPassword" type="password" placeholder="Minimum 6 characters">
+      <button class="primary auth-button" onclick="registerUser()">Create Account</button>
+      <button class="text-button" onclick="showLogin()">Back to Login</button>
+      <button class="guest-button" onclick="continueAsGuest()">Continue as Guest</button>
+    </div>
+    <div id="authMessage" class="auth-message"></div>
+  </div>
+</div>
+
+<footer>
+    <p>StudentFix AI — Check before you submit.</p>
+</footer>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
