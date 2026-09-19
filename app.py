@@ -1,58 +1,93 @@
 import os
 import re
 import json
-from flask import Flask, render_template, request, jsonify, session
-from werkzeug.security import generate_password_hash, check_password_hash
+import time
+
+from flask import Flask, request, jsonify, render_template, session
 from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
 from dotenv import load_dotenv
-from google import genai
-import fitz
-from PyPDF2 import PdfReader
+
+try:
+    from google import genai
+except Exception:
+    genai = None
+
+try:
+    import fitz
+except Exception:
+    fitz = None
+
+
+# =====================================================
+# APP SETUP
+# =====================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Always load the .env that belongs to this project, even if Flask is started
-# from a different working directory.
-ENV_FILE = os.path.join(BASE_DIR, ".env")
-load_dotenv(dotenv_path=ENV_FILE, override=True)
-UPLOAD_FOLDER = os.path.join(BASE_DIR, "uploads")
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 app = Flask(__name__)
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "studentfix.db")
+
+app.config["SECRET_KEY"] = os.getenv(
+    "SECRET_KEY",
+    "studentfix-ai-local-secret-change-this"
+)
+
+app.config["SQLALCHEMY_DATABASE_URI"] = (
+    "sqlite:///" + os.path.join(BASE_DIR, "studentfix.db")
+)
+
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "studentfix-dev-secret-change-me")
-app.config["SESSION_COOKIE_HTTPONLY"] = True
-app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 db = SQLAlchemy(app)
 
 
+# =====================================================
+# DATABASE MODEL
+# =====================================================
+
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(120), nullable=False)
-    email = db.Column(db.String(255), unique=True, nullable=False, index=True)
-    password_hash = db.Column(db.String(255), nullable=False)
+    email = db.Column(db.String(200), unique=True, nullable=False)
+    password_hash = db.Column(db.String(300), nullable=False)
 
 
 class Record(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    module = db.Column(db.String(80), nullable=False)
-    input_text = db.Column(db.Text, default="")
-    result = db.Column(db.Text, default="")
+    user_id = db.Column(db.Integer, nullable=True)
+    module = db.Column(db.String(100), nullable=False)
+    result = db.Column(db.Text, nullable=False)
 
 
 with app.app_context():
     db.create_all()
 
 
+# =====================================================
+# GEMINI
+# =====================================================
+
 def get_gemini_client():
-    # Re-read the project's .env every time so a newly-added key is picked up
-    # after a normal Flask restart, regardless of the terminal working folder.
-    load_dotenv(dotenv_path=ENV_FILE, override=True)
-    api_key = (os.getenv("GEMINI_API_KEY") or "").strip().strip("\'").strip("\"")
-    if not api_key or api_key == "YOUR_GEMINI_API_KEY":
+    """
+    Creates the Gemini client only when a valid-looking
+    API key exists.
+
+    The real key stays on the server in .env.
+    """
+
+    if genai is None:
         return None
+
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+
+    if not api_key:
+        return None
+
+    if len(api_key) < 20:
+        return None
+
     try:
         return genai.Client(api_key=api_key)
     except Exception:
@@ -60,706 +95,1532 @@ def get_gemini_client():
 
 
 def ask_ai(prompt):
+    """
+    Returns AI text when Gemini is available.
+
+    Automatically retries temporary Gemini 429/503 errors
+    using exponential backoff: 2s -> 4s -> 8s.
+
+    Returns None when Gemini is unavailable so the
+    application can safely use its local fallback.
+    """
+
     client = get_gemini_client()
-    if not client:
-        return (
-            "ERROR: GEMINI_API_KEY is missing or invalid.\n\n"
-            "Put your real Gemini API key in StudentFix_AI/.env as "
-            "GEMINI_API_KEY=YOUR_REAL_KEY, save the file, stop Flask with Ctrl+C, "
-            "then run python app.py again."
-        )
-    try:
-        response = client.models.generate_content(
-            model=(os.getenv("GEMINI_MODEL") or "gemini-3.6-flash").strip(),
-            contents=prompt
-        )
-        return response.text or "No response received from AI."
-    except Exception as e:
-        return f"AI ERROR: {str(e)}"
 
-
-def current_user():
-    user_id = session.get("user_id")
-    if not user_id:
+    if client is None:
         return None
-    return db.session.get(User, user_id)
+
+    model_name = os.getenv(
+        "GEMINI_MODEL",
+        "gemini-3.6-flash"
+    )
+
+    # Retry delays: 2 seconds, 4 seconds, 8 seconds
+    retry_delays = [2, 4, 8]
+
+    for attempt, delay in enumerate(retry_delays):
+
+        try:
+
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
+
+            text = getattr(response, "text", None)
+
+            if text and text.strip():
+                return text.strip()
+
+            return None
+
+        except Exception as error:
+
+            error_text = str(error).lower()
+
+            temporary_error = any(
+                word in error_text
+                for word in [
+                    "429",
+                    "quota",
+                    "resource_exhausted",
+                    "rate limit",
+                    "503",
+                    "unavailable",
+                    "high demand",
+                    "temporarily",
+                    "overloaded",
+                    "service unavailable"
+                ]
+            )
+
+            # Retry only temporary Gemini errors.
+            if temporary_error and attempt < len(retry_delays) - 1:
+
+                time.sleep(delay)
+                continue
+
+            # Never send Gemini's raw error to the browser.
+            return None
+
+    return None
+
+# =====================================================
+# GENERAL HELPERS
+# =====================================================
+
+def clean_lines(text):
+    if not text:
+        return []
+
+    lines = []
+
+    for line in text.splitlines():
+
+        line = re.sub(
+            r"^[\s•●○▪▫\-*]+\s*",
+            "",
+            line
+        ).strip()
+
+        line = re.sub(
+            r"^\d+[\.\)]\s*",
+            "",
+            line
+        ).strip()
+
+        if line:
+            lines.append(line)
+
+    return lines
 
 
-def login_required_json():
-    if current_user() is None and not session.get("guest"):
-        return jsonify({
-            "success": False,
-            "auth_required": True,
-            "message": "Please login or continue as guest."
-        }), 401
+def safe_json_from_ai(text):
+    if not text:
+        return None
+
+    text = text.strip()
+
+    text = re.sub(
+        r"^```json\s*",
+        "",
+        text,
+        flags=re.IGNORECASE
+    )
+
+    text = re.sub(
+        r"^```\s*",
+        "",
+        text
+    )
+
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text
+    )
+
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+
+    match = re.search(
+        r"\{.*\}",
+        text,
+        flags=re.DOTALL
+    )
+
+    if match:
+
+        try:
+            return json.loads(match.group(0))
+        except Exception:
+            return None
+
     return None
 
 
-def save_record(module, input_text, result):
+def save_record(module, result):
 
-    try:
-        record = Record(
-            module=module,
-            input_text=(input_text or "")[:10000],
-            result=(result or "")[:30000]
+    user_id = session.get("user_id")
+
+    record = Record(
+        user_id=user_id,
+        module=module,
+        result=str(result)
+    )
+
+    db.session.add(record)
+    db.session.commit()
+
+
+def current_user_id():
+    return session.get("user_id")
+
+
+# =====================================================
+# LOCAL FALLBACK - REQUIREMENTS
+# =====================================================
+
+def fallback_requirements(text):
+
+    text_lower = (text or "").lower()
+
+    documents = []
+
+    possible_documents = [
+        (
+            "Aadhaar / ID Proof",
+            [
+                "aadhaar",
+                "aadhar",
+                "identity proof",
+                "id proof"
+            ]
+        ),
+        (
+            "10th Marks Memo",
+            [
+                "10th marks",
+                "10th mark",
+                "ssc marks",
+                "ssc memo",
+                "tenth marks"
+            ]
+        ),
+        (
+            "Intermediate / 12th Marks Memo",
+            [
+                "intermediate",
+                "12th marks",
+                "12th mark",
+                "hsc marks"
+            ]
+        ),
+        (
+            "Current Academic Marks Memo",
+            [
+                "current academic",
+                "semester marks",
+                "academic marks",
+                "latest marks"
+            ]
+        ),
+        (
+            "Bonafide Certificate",
+            [
+                "bonafide",
+                "bonafide certificate"
+            ]
+        ),
+        (
+            "Income Certificate",
+            [
+                "income certificate",
+                "family income"
+            ]
+        ),
+        (
+            "Caste Certificate",
+            [
+                "caste certificate",
+                "community certificate"
+            ]
+        ),
+        (
+            "Residence Certificate",
+            [
+                "residence certificate",
+                "residential certificate"
+            ]
+        ),
+        (
+            "Domicile Certificate",
+            [
+                "domicile"
+            ]
+        ),
+        (
+            "Bank Account Details",
+            [
+                "bank account",
+                "bank details",
+                "bank passbook"
+            ]
+        ),
+        (
+            "Passport Size Photograph",
+            [
+                "passport size",
+                "passport photograph",
+                "passport photo"
+            ]
         )
-        db.session.add(record)
-        db.session.commit()
-    except Exception:
-        db.session.rollback()
+    ]
+
+    for name, keywords in possible_documents:
+
+        if any(keyword in text_lower for keyword in keywords):
+
+            documents.append({
+                "name": name,
+                "required": "Yes",
+                "accepted_format": "PDF / JPG / PNG",
+                "special_condition": ""
+            })
+
+    if not documents:
+
+        documents = [
+            {
+                "name": "Identity Proof",
+                "required": "Yes",
+                "accepted_format": "PDF / JPG / PNG",
+                "special_condition": "Check the official application instructions."
+            },
+            {
+                "name": "Educational Certificate / Marks Memo",
+                "required": "Yes",
+                "accepted_format": "PDF / JPG / PNG",
+                "special_condition": "Use the latest applicable certificate."
+            },
+            {
+                "name": "Passport Size Photograph",
+                "required": "May be required",
+                "accepted_format": "JPG / PNG",
+                "special_condition": ""
+            }
+        ]
+
+    eligibility = []
+
+    eligibility_keywords = [
+        "student",
+        "education",
+        "academic",
+        "income",
+        "residence",
+        "age",
+        "merit",
+        "scholarship",
+        "category"
+    ]
+
+    for keyword in eligibility_keywords:
+
+        if keyword in text_lower:
+            eligibility.append(
+                keyword.capitalize()
+            )
+
+    if not eligibility:
+        eligibility = [
+            "Check applicant eligibility in the official notice.",
+            "Verify academic and category conditions."
+        ]
+
+    conditions = []
+
+    for line in clean_lines(text):
+
+        lower = line.lower()
+
+        if any(
+            word in lower
+            for word in [
+                "must",
+                "should",
+                "required",
+                "only",
+                "valid",
+                "original",
+                "attested",
+                "self attested"
+            ]
+        ):
+
+            if len(line) <= 250:
+                conditions.append(line)
+
+        if len(conditions) >= 6:
+            break
+
+    if not conditions:
+
+        conditions = [
+            "Verify that uploaded documents are clear and readable.",
+            "Submit documents in the format requested by the official application.",
+            "Check all personal details before submission."
+        ]
+
+    deadline = None
+
+    deadline_patterns = [
+        r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+        r"\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{2,4}\b",
+        r"\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+\d{1,2},?\s+\d{2,4}\b"
+    ]
+
+    for pattern in deadline_patterns:
+
+        match = re.search(
+            pattern,
+            text or "",
+            flags=re.IGNORECASE
+        )
+
+        if match:
+            deadline = match.group(0)
+            break
+
+    return {
+        "documents": documents,
+        "eligibility": eligibility,
+        "conditions": conditions,
+        "deadline": deadline
+    }
 
 
-def safe_filename(filename):
-    """Keep uploads inside the project uploads folder."""
-    return os.path.basename(filename)
+# =====================================================
+# DOCUMENT PDF EXTRACTION
+# =====================================================
 
+def extract_pdf_text(file_storage):
 
-def read_uploaded_file(file):
-    """Read PDF/DOCX/TXT content for AI modules."""
-    if not file or not file.filename:
+    if fitz is None:
         return ""
 
-    filename = file.filename.lower()
-
     try:
-        if filename.endswith(".pdf"):
-            pdf = fitz.open(stream=file.read(), filetype="pdf")
-            text = "\n".join(page.get_text() for page in pdf)
-            pdf.close()
-            return text
 
-        if filename.endswith(".docx"):
-            from docx import Document
-            document = Document(file)
-            return "\n".join(p.text for p in document.paragraphs)
+        file_bytes = file_storage.read()
 
-        return file.read().decode("utf-8", errors="ignore")
-    except Exception as e:
-        return f"[Could not read {file.filename}: {e}]"
+        if not file_bytes:
+            return ""
+
+        document = fitz.open(
+            stream=file_bytes,
+            filetype="pdf"
+        )
+
+        pages = []
+
+        for page in document:
+
+            text = page.get_text()
+
+            if text:
+                pages.append(text)
+
+        document.close()
+
+        return "\n".join(pages)
+
+    except Exception:
+
+        return ""
 
 
-# =========================================================
-# AUTHENTICATION
-# =========================================================
+# =====================================================
+# REQUIREMENTS ANALYSIS
+# =====================================================
 
-@app.route("/auth/status", methods=["GET"])
+def detect_requirements(text):
+
+    fallback = fallback_requirements(text)
+
+    prompt = f"""
+You are StudentFix AI.
+
+Analyze the following official application requirements document.
+
+Return ONLY valid JSON in exactly this structure:
+
+{{
+  "documents": [
+    {{
+      "name": "Document name",
+      "required": "Yes / No / May be required",
+      "accepted_format": "PDF / JPG / PNG / etc.",
+      "special_condition": "condition or empty string"
+    }}
+  ],
+  "eligibility": [
+    "eligibility point"
+  ],
+  "conditions": [
+    "important condition"
+  ],
+  "deadline": "deadline or null"
+}}
+
+Do not invent requirements.
+If something is not clearly available, use an empty list or null.
+
+DOCUMENT TEXT:
+{text[:30000]}
+"""
+
+    raw = ask_ai(prompt)
+
+    parsed = safe_json_from_ai(raw)
+
+    if not isinstance(parsed, dict):
+        return fallback
+
+    documents = parsed.get("documents")
+
+    if not isinstance(documents, list):
+        return fallback
+
+    cleaned_documents = []
+
+    for item in documents:
+
+        if isinstance(item, str):
+
+            cleaned_documents.append({
+                "name": item,
+                "required": "Yes",
+                "accepted_format": "",
+                "special_condition": ""
+            })
+
+        elif isinstance(item, dict):
+
+            name = str(
+                item.get("name", "")
+            ).strip()
+
+            if name:
+
+                cleaned_documents.append({
+                    "name": name,
+                    "required": str(
+                        item.get(
+                            "required",
+                            "Yes"
+                        )
+                    ),
+                    "accepted_format": str(
+                        item.get(
+                            "accepted_format",
+                            ""
+                        )
+                    ),
+                    "special_condition": str(
+                        item.get(
+                            "special_condition",
+                            ""
+                        )
+                    )
+                })
+
+    if not cleaned_documents:
+        return fallback
+
+    return {
+        "documents": cleaned_documents,
+        "eligibility": (
+            parsed.get("eligibility")
+            if isinstance(
+                parsed.get("eligibility"),
+                list
+            )
+            else fallback["eligibility"]
+        ),
+        "conditions": (
+            parsed.get("conditions")
+            if isinstance(
+                parsed.get("conditions"),
+                list
+            )
+            else fallback["conditions"]
+        ),
+        "deadline": parsed.get(
+            "deadline",
+            fallback["deadline"]
+        )
+    }
+
+
+# =====================================================
+# AUTH
+# =====================================================
+
+@app.post("/auth/status")
+@app.get("/auth/status")
 def auth_status():
-    user = current_user()
-    if user:
-        return jsonify({
-            "authenticated": True,
-            "guest": False,
-            "name": user.name,
-            "email": user.email
-        })
-    if session.get("guest"):
-        return jsonify({
-            "authenticated": False,
-            "guest": True,
-            "name": "Guest"
-        })
-    return jsonify({"authenticated": False, "guest": False})
+
+    user_id = session.get("user_id")
+
+    if user_id:
+
+        user = db.session.get(
+            User,
+            user_id
+        )
+
+        if user:
+
+            return jsonify({
+                "authenticated": True,
+                "guest": False,
+                "name": user.name,
+                "email": user.email
+            })
+
+        session.clear()
+
+    return jsonify({
+        "authenticated": False,
+        "guest": bool(
+            session.get("guest")
+        ),
+        "name": "",
+        "email": ""
+    })
 
 
-@app.route("/auth/register", methods=["POST"])
+@app.post("/auth/register")
 def register():
-    data = request.get_json(silent=True) or {}
-    name = (data.get("name") or "").strip()
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
+
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    name = str(
+        data.get("name", "")
+    ).strip()
+
+    email = str(
+        data.get("email", "")
+    ).strip().lower()
+
+    password = str(
+        data.get("password", "")
+    )
 
     if not name or not email or not password:
-        return jsonify({"success": False, "message": "Name, email and password are required."}), 400
-    if "@" not in email or "." not in email.split("@")[-1]:
-        return jsonify({"success": False, "message": "Please enter a valid email address."}), 400
+
+        return jsonify({
+            "success": False,
+            "message": "Please fill all fields."
+        }), 400
+
     if len(password) < 6:
-        return jsonify({"success": False, "message": "Password must be at least 6 characters."}), 400
-    if User.query.filter_by(email=email).first():
-        return jsonify({"success": False, "message": "An account with this email already exists."}), 409
+
+        return jsonify({
+            "success": False,
+            "message": "Password must be at least 6 characters."
+        }), 400
+
+    existing = User.query.filter_by(
+        email=email
+    ).first()
+
+    if existing:
+
+        return jsonify({
+            "success": False,
+            "message": "An account with this email already exists."
+        }), 409
 
     user = User(
         name=name,
         email=email,
-        password_hash=generate_password_hash(password)
+        password_hash=generate_password_hash(
+            password
+        )
     )
+
     db.session.add(user)
     db.session.commit()
 
     session.clear()
+
     session["user_id"] = user.id
+
     return jsonify({
         "success": True,
         "name": user.name,
         "email": user.email,
-        "message": "Account created successfully."
+        "guest": False
     })
 
 
-@app.route("/auth/login", methods=["POST"])
+@app.post("/auth/login")
 def login():
-    data = request.get_json(silent=True) or {}
-    email = (data.get("email") or "").strip().lower()
-    password = data.get("password") or ""
 
-    user = User.query.filter_by(email=email).first()
-    if not user or not check_password_hash(user.password_hash, password):
-        return jsonify({"success": False, "message": "Incorrect email or password."}), 401
+    data = request.get_json(
+        silent=True
+    ) or {}
+
+    email = str(
+        data.get("email", "")
+    ).strip().lower()
+
+    password = str(
+        data.get("password", "")
+    )
+
+    if not email or not password:
+
+        return jsonify({
+            "success": False,
+            "message": "Please enter your email and password."
+        }), 400
+
+    user = User.query.filter_by(
+        email=email
+    ).first()
+
+    if not user:
+
+        return jsonify({
+            "success": False,
+            "message": "Invalid email or password."
+        }), 401
+
+    if not check_password_hash(
+        user.password_hash,
+        password
+    ):
+
+        return jsonify({
+            "success": False,
+            "message": "Invalid email or password."
+        }), 401
 
     session.clear()
+
     session["user_id"] = user.id
+
     return jsonify({
         "success": True,
         "name": user.name,
         "email": user.email,
-        "message": "Login successful."
+        "guest": False
     })
 
 
-@app.route("/auth/guest", methods=["POST"])
-def guest_login():
+@app.post("/auth/guest")
+def guest():
+
     session.clear()
+
     session["guest"] = True
-    return jsonify({"success": True, "guest": True, "name": "Guest"})
+
+    return jsonify({
+        "success": True,
+        "guest": True,
+        "name": "Guest",
+        "email": ""
+    })
 
 
-@app.route("/auth/logout", methods=["POST"])
+@app.post("/auth/logout")
 def logout():
+
     session.clear()
-    return jsonify({"success": True})
+
+    return jsonify({
+        "success": True
+    })
 
 
-# =========================================================
-# DOCUMENTFIX - imported/adapted from df1
-# =========================================================
+# =====================================================
+# DOCUMENTFIX - ANALYZE REQUIREMENTS
+# =====================================================
 
-def extract_pdf_text(file_path):
-    try:
-        reader = PdfReader(file_path)
-        text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text += page_text + "\n"
-        return text
-    except Exception:
-        return ""
-
-
-def detect_requirements(text):
-    """Extract requirements from the ACTUAL uploaded application using Gemini.
-    No hard-coded/default document list is used. If the document does not state a
-    requirement, the AI is instructed to return an empty list instead of guessing.
-    """
-    clean_text = (text or "").strip()
-    if not clean_text:
-        return {"documents": [], "deadline": None, "eligibility": [], "conditions": [], "raw_text": ""}
-
-    # Keep the prompt bounded so very large PDFs do not overwhelm the model.
-    source = clean_text[:18000]
-    prompt = f"""
-You are StudentFix AI's Requirement Intelligence engine.
-
-Read ONLY the application/requirements document below. Extract information that is
-explicitly stated in that document. NEVER invent, assume, or use a generic list of
-student documents.
-
-Return ONLY valid JSON with exactly these keys:
-{{
-  "documents": ["document 1", "document 2"],
-  "eligibility": ["eligibility rule 1", "eligibility rule 2"],
-  "deadline": "exact deadline text or null",
-  "conditions": ["important condition 1", "condition 2"]
-}}
-
-Rules:
-- "documents" must contain only documents/proofs explicitly required for submission.
-- Do not add Aadhaar, income certificate, bonafide, passport photo, etc. unless the
-  uploaded document explicitly requires them.
-- "eligibility" should contain explicit eligibility rules such as age, marks,
-  course/year, income, domicile, category, citizenship, etc.
-- "deadline" must be copied as a short exact phrase/date from the document when present.
-- "conditions" should contain other explicit application conditions/instructions.
-- If something is not stated, return an empty list or null.
-
-UPLOADED DOCUMENT:
----
-{source}
----
-"""
-
-    raw = ask_ai(prompt)
-    if raw.startswith("ERROR:") or raw.startswith("AI ERROR:"):
-        raise RuntimeError(raw)
-
-    # Gemini may wrap JSON in markdown fences; strip those safely.
-    candidate = raw.strip()
-    if candidate.startswith("```"):
-        candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.I)
-        candidate = re.sub(r"\s*```$", "", candidate)
-
-    try:
-        data = json.loads(candidate)
-    except json.JSONDecodeError:
-        # Recover the first JSON object if the model added a short explanation.
-        match = re.search(r"\{.*\}", candidate, flags=re.S)
-        if not match:
-            raise RuntimeError("AI returned an invalid requirements response. Please try again.")
-        try:
-            data = json.loads(match.group(0))
-        except json.JSONDecodeError:
-            raise RuntimeError("AI returned an invalid requirements response. Please try again.")
-
-    documents = data.get("documents") or []
-    eligibility = data.get("eligibility") or []
-    conditions = data.get("conditions") or []
-    deadline = data.get("deadline")
-
-    # Normalize to clean strings and remove duplicates while preserving order.
-    def clean_list(values):
-        out = []
-        for value in values if isinstance(values, list) else []:
-            value = str(value).strip()
-            if value and value not in out:
-                out.append(value)
-        return out
-
-    return {
-        "documents": clean_list(documents),
-        "deadline": str(deadline).strip() if deadline not in (None, "", "null") else None,
-        "eligibility": clean_list(eligibility),
-        "conditions": clean_list(conditions),
-        "raw_text": clean_text[:5000]
-    }
-
-
-@app.route("/analyze-requirements", methods=["POST"])
+@app.post("/analyze-requirements")
 def analyze_requirements():
-    auth_error = login_required_json()
-    if auth_error:
-        return auth_error
 
-    if "file" not in request.files:
-        return jsonify({"success": False, "message": "No file uploaded."})
+    file = request.files.get("file")
 
-    file = request.files["file"]
-    if not file.filename:
-        return jsonify({"success": False, "message": "Please select a PDF."})
+    if not file:
+
+        return jsonify({
+            "success": False,
+            "message": "Please upload the requirements PDF."
+        }), 400
 
     if not file.filename.lower().endswith(".pdf"):
-        return jsonify({"success": False, "message": "Only PDF files are supported."})
 
-    filename = safe_filename(file.filename)
-    file_path = os.path.join(UPLOAD_FOLDER, filename)
-
-    try:
-        file.save(file_path)
-        text = extract_pdf_text(file_path)
-
-        if not text:
-            return jsonify({
-                "success": False,
-                "message": "Could not extract text from this PDF. Try a text-based PDF."
-            })
-
-        result = detect_requirements(text)
-        save_record(
-            "DocumentFix - Requirements",
-            text,
-            json_safe_result(result)
-        )
-        return jsonify({"success": True, "result": result})
-    except Exception as e:
-        return jsonify({"success": False, "message": str(e) or "Could not process PDF."})
-
-
-@app.route("/check-documents", methods=["POST"])
-def check_documents():
-    auth_error = login_required_json()
-    if auth_error:
-        return auth_error
-
-    files = request.files.getlist("documents")
-    required_documents = request.form.get("required_documents", "")
-    application_name = request.form.get("application_name", "")
-    application_dob = request.form.get("application_dob", "")
-
-    if not files:
         return jsonify({
             "success": False,
-            "message": "Please upload at least one document."
+            "message": "Please upload a PDF file."
+        }), 400
+
+    text = extract_pdf_text(file)
+
+    if not text.strip():
+
+        return jsonify({
+            "success": True,
+            "result": fallback_requirements("")
         })
 
-    required_list = [
-        item.strip()
-        for item in required_documents.split(",")
-        if item.strip()
-    ]
+    result = detect_requirements(text)
 
-    uploaded_names = []
+    return jsonify({
+        "success": True,
+        "result": result
+    })
 
-    for file in files:
-        if not file.filename:
+
+# =====================================================
+# DOCUMENT NAME MATCHING
+# =====================================================
+
+def normalize_name(value):
+
+    value = str(value or "").lower()
+
+    replacements = {
+        "aadhaar": "id",
+        "aadhar": "id",
+        "identity": "id",
+        "proof": "",
+        "certificate": "",
+        "cert": "",
+        "marks": "mark",
+        "memo": "",
+        "document": "",
+        "photo": "photograph"
+    }
+
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+
+    value = re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        value
+    )
+
+    return set(
+        word
+        for word in value.split()
+        if len(word) > 2
+    )
+
+
+def document_matches(
+    required_name,
+    uploaded_names
+):
+
+    required_words = normalize_name(
+        required_name
+    )
+
+    if not required_words:
+        return False
+
+    for filename in uploaded_names:
+
+        filename_words = normalize_name(
+            filename
+        )
+
+        if not filename_words:
             continue
 
-        filename = safe_filename(file.filename)
-        uploaded_names.append(filename.lower())
+        common = (
+            required_words &
+            filename_words
+        )
 
-        try:
-            file.save(os.path.join(UPLOAD_FOLDER, filename))
-        except Exception:
-            pass
+        if len(common) >= 2:
+            return True
 
-    if not uploaded_names:
+        for word in required_words:
+
+            if len(word) >= 4:
+
+                if any(
+                    word in other
+                    or other in word
+                    for other in filename_words
+                ):
+                    return True
+
+    return False
+
+
+# =====================================================
+# DOCUMENTFIX - CHECK DOCUMENTS
+# =====================================================
+
+@app.post("/check-documents")
+def check_documents():
+
+    uploaded = request.files.getlist(
+        "documents"
+    )
+
+    if not uploaded:
+
         return jsonify({
             "success": False,
-            "message": "No valid documents were selected."
-        })
+            "message": "Please upload your documents first."
+        }), 400
 
-    missing_documents = []
+    required_raw = request.form.get(
+        "required_documents",
+        "[]"
+    )
 
-    for required in required_list:
-        found = False
-        required_words = required.lower().split()
+    try:
 
-        for uploaded in uploaded_names:
-            matches = sum(
-                1 for word in required_words
-                if len(word) > 3 and word in uploaded
-            )
-            if matches >= 1:
-                found = True
-                break
+        required_data = json.loads(
+            required_raw
+        )
 
-        if not found:
-            missing_documents.append(required)
+    except Exception:
 
-    format_issues = []
-    allowed = (".pdf", ".jpg", ".jpeg", ".png")
+        required_data = []
 
-    for uploaded in uploaded_names:
-        if not uploaded.endswith(allowed):
-            format_issues.append(
-                f"{uploaded} has an unsupported format."
-            )
+    required_documents = []
+
+    if isinstance(required_data, list):
+
+        for item in required_data:
+
+            if isinstance(item, str):
+
+                name = item.strip()
+
+            elif isinstance(item, dict):
+
+                name = str(
+                    item.get("name", "")
+                ).strip()
+
+            else:
+
+                name = ""
+
+            if name:
+                required_documents.append(name)
+
+    uploaded_names = [
+        file.filename or ""
+        for file in uploaded
+    ]
+
+    missing = []
+
+    matched = []
+
+    for required in required_documents:
+
+        if document_matches(
+            required,
+            uploaded_names
+        ):
+
+            matched.append(required)
+
+        else:
+
+            missing.append(required)
+
+    uploaded_count = len(uploaded)
+
+    total_required = len(
+        required_documents
+    )
+
+    if total_required == 0:
+
+        readiness = 70
+
+    else:
+
+        readiness = round(
+            (
+                len(matched) /
+                total_required
+            ) * 100
+        )
 
     mismatches = []
 
-    if application_name:
-        important_words = [
-            word.lower()
-            for word in application_name.split()
-            if len(word) > 3
-        ]
+    if uploaded_count > total_required and total_required > 0:
 
-        for filename in uploaded_names:
-            filename_clean = re.sub(r"[^a-zA-Z]", "", filename).lower()
+        mismatches.append(
+            "Some uploaded files may not correspond to the listed requirements."
+        )
 
-            if important_words and not any(
-                word in filename_clean for word in important_words
-            ):
-                mismatches.append(
-                    f"Possible name mismatch detected in {filename}"
-                )
+    high_priority = []
 
-    if application_dob:
-        dob_numbers = re.sub(r"[^0-9]", "", application_dob)
+    if missing:
 
-        for filename in uploaded_names:
-            filename_numbers = re.sub(r"[^0-9]", "", filename)
+        for item in missing[:10]:
 
-            if dob_numbers and len(dob_numbers) >= 4:
-                if dob_numbers[:4] not in filename_numbers:
-                    mismatches.append(
-                        f"Please verify DOB in {filename}"
-                    )
+            high_priority.append(
+                f"Missing or not clearly matched: {item}"
+            )
 
-    total_requirements = len(required_list)
-
-    if total_requirements == 0:
-        document_score = 100
-    else:
-        completed = total_requirements - len(missing_documents)
-        document_score = int((completed / total_requirements) * 100)
-
-    mismatch_penalty = min(len(mismatches) * 10, 30)
-    format_penalty = min(len(format_issues) * 5, 20)
-    readiness = max(0, document_score - mismatch_penalty - format_penalty)
-
-    high_priority = [
-        f"Missing mandatory document: {item}"
-        for item in missing_documents
-    ]
-    medium_priority = list(mismatches)
-    low_priority = list(format_issues)
-
-    fixes = [f"Upload {item}" for item in missing_documents]
+    medium_priority = []
 
     if mismatches:
-        fixes.append("Verify personal information across your documents")
 
-    if format_issues:
-        fixes.append("Convert unsupported files to PDF, JPG or PNG")
+        medium_priority.extend(
+            mismatches
+        )
+
+    low_priority = []
+
+    for filename in uploaded_names:
+
+        extension = os.path.splitext(
+            filename
+        )[1].lower()
+
+        if extension not in [
+            ".pdf",
+            ".jpg",
+            ".jpeg",
+            ".png"
+        ]:
+
+            low_priority.append(
+                f"Check file format: {filename}"
+            )
+
+    fixes = []
+
+    for item in missing[:10]:
+
+        fixes.append(
+            f"Upload or verify: {item}"
+        )
 
     if not fixes:
-        fixes.append("Perform a final manual review before submission.")
+
+        fixes.append(
+            "Review all uploaded documents manually before submission."
+        )
 
     if readiness >= 90:
-        status = "Ready to Submit"
+
+        status = "Looks Ready"
+
     elif readiness >= 70:
-        status = "Needs Attention"
+
+        status = "Needs a Few Checks"
+
     else:
+
         status = "Incomplete"
 
     result = {
         "readiness": readiness,
         "status": status,
-        "missing_documents": missing_documents,
+        "uploaded_count": uploaded_count,
+        "missing_documents": missing,
         "mismatches": mismatches,
-        "format_issues": format_issues,
         "high_priority": high_priority,
         "medium_priority": medium_priority,
         "low_priority": low_priority,
-        "fixes": fixes,
-        "uploaded_count": len(uploaded_names),
-        "required_count": total_requirements
+        "fixes": fixes
     }
 
     save_record(
-        "DocumentFix - Application Check",
-        ", ".join(uploaded_names),
-        json_safe_result(result)
+        "DocumentFix",
+        json.dumps(
+            result,
+            indent=2
+        )
     )
 
-    return jsonify({"success": True, "result": result})
-
-
-def json_safe_result(data):
-    import json
-    return json.dumps(data, indent=2)
-
-
-# =========================================================
-# RESUMEFIX - kept from StudentFix
-# =========================================================
-
-@app.route("/resumefix", methods=["POST"])
-def resumefix():
-    auth_error = login_required_json()
-    if auth_error:
-        return auth_error
-
-    job = request.form.get("job", "")
-    resume = request.files.get("resume")
-    text = read_uploaded_file(resume)
-
-    if not text:
-        return jsonify({"result": "Please upload a resume."})
-
-    prompt = f"""
-You are ResumeFix AI.
-
-RESUME:
-{text}
-
-JOB DESCRIPTION:
-{job}
-
-Analyze the resume for:
-- ATS friendliness
-- Job match
-- Skills
-- Projects
-- Keywords
-- Weak points
-- Grammar/clarity
-- Missing skills or evidence
-
-Do not invent experience.
-
-Return:
-ATS SCORE: XX/100
-JOB MATCH: XX%
-
-STRENGTHS:
-- ...
-
-PROBLEMS:
-- ...
-
-MISSING/RECOMMENDED SKILLS:
-- ...
-
-IMPROVEMENTS:
-- ...
-
-BETTER SUMMARY:
-...
-"""
-    result = ask_ai(prompt)
-    save_record("ResumeFix", text + "\nJOB:\n" + job, result)
-    return jsonify({"result": result})
-
-
-# =========================================================
-# CAREERMATE - kept from StudentFix
-# =========================================================
-
-@app.route("/careermate", methods=["POST"])
-def careermate():
-    auth_error = login_required_json()
-    if auth_error:
-        return auth_error
-
-    goal = request.form.get("goal", "")
-    skills = request.form.get("skills", "")
-
-    if not goal:
-        return jsonify({"result": "Please enter your career goal."})
-
-    prompt = f"""
-You are CareerMate AI for college students.
-
-CAREER GOAL:
-{goal}
-
-CURRENT SKILLS:
-{skills}
-
-Create a realistic beginner-friendly roadmap.
-
-Return:
-CURRENT LEVEL:
-...
-
-SKILL GAPS:
-- ...
-
-3-MONTH ROADMAP:
-
-MONTH 1:
-- ...
-
-MONTH 2:
-- ...
-
-MONTH 3:
-- ...
-
-PROJECTS TO BUILD:
-- ...
-
-INTERVIEW TOPICS:
-- ...
-
-NEXT 5 ACTIONS:
-1. ...
-2. ...
-3. ...
-4. ...
-5. ...
-"""
-    result = ask_ai(prompt)
-    save_record("CareerMate", goal + "\n" + skills, result)
-    return jsonify({"result": result})
-
-
-# =========================================================
-# INTERVIEWMATE - kept from StudentFix
-# =========================================================
-
-@app.route("/interview/question", methods=["POST"])
-def interview_question():
-    auth_error = login_required_json()
-    if auth_error:
-        return auth_error
-
-    role = request.form.get("role", "Software Developer")
-
-    prompt = f"""
-You are InterviewMate.
-Generate ONE interview question for a fresher applying for:
-{role}
-
-Ask only one question. Do not give the answer.
-"""
-    result = ask_ai(prompt)
-    return jsonify({"question": result})
-
-
-@app.route("/interview/evaluate", methods=["POST"])
-def evaluate_interview():
-    auth_error = login_required_json()
-    if auth_error:
-        return auth_error
-
-    question = request.form.get("question", "")
-    answer = request.form.get("answer", "")
-
-    prompt = f"""
-You are InterviewMate, an AI interviewer.
-
-QUESTION:
-{question}
-
-CANDIDATE ANSWER:
-{answer}
-
-Evaluate fairly. If the question is technical, assess technical correctness.
-For behavioral questions, assess relevance and communication.
-
-Return:
-OVERALL SCORE: X/10
-TECHNICAL/CONTENT: X/10
-COMMUNICATION: X/10
-CLARITY: X/10
-
-WHAT WAS GOOD:
-- ...
-
-WHAT TO IMPROVE:
-- ...
-
-BETTER ANSWER:
-...
-"""
-    result = ask_ai(prompt)
-    save_record("InterviewMate", answer, result)
-    return jsonify({"result": result})
-
-
-# =========================================================
-# HISTORY
-# =========================================================
-
-@app.route("/history", methods=["GET"])
-def history():
-    auth_error = login_required_json()
-    if auth_error:
-        return auth_error
-
-    records = Record.query.order_by(Record.id.desc()).limit(30).all()
-    return jsonify([
-        {
-            "id": r.id,
-            "module": r.module,
-            "result": r.result,
-        }
-        for r in records
-    ])
-
-
-@app.route("/health", methods=["GET"])
-def health():
     return jsonify({
-        "status": "ok",
-        "gemini_configured": bool(get_gemini_client())
+        "success": True,
+        "result": result
     })
 
 
-@app.route("/", methods=["GET"])
-def home():
-    return render_template("index.html")
+# =====================================================
+# RESUMEFIX FALLBACK
+# =====================================================
 
+def fallback_resume(job):
+
+    job = job.strip()
+
+    if not job:
+
+        return """Resume review completed.
+
+Please add:
+1. A clear professional summary.
+2. Your technical skills.
+3. Education details.
+4. Projects with your role and technologies.
+5. Internship or experience details.
+6. Relevant achievements.
+
+Tip: Keep your resume clear, concise and easy to scan."""
+
+    return f"""Resume review completed for the target role:
+
+{job}
+
+Recommended improvements:
+
+1. Add a clear summary matching the target role.
+2. Highlight skills that appear in the job description.
+3. Add 2–3 relevant academic or personal projects.
+4. Describe projects using action + technology + result.
+5. Keep education details accurate and concise.
+6. Check spelling, grammar and formatting.
+7. Put the most relevant skills near the top.
+8. Avoid unnecessary personal information.
+
+This is a general review. Compare the final resume with the actual job description before submitting."""
+
+
+# =====================================================
+# RESUMEFIX
+# =====================================================
+
+@app.post("/resumefix")
+def resume_fix():
+
+    resume = request.files.get(
+        "resume"
+    )
+
+    job = request.form.get(
+        "job",
+        ""
+    ).strip()
+
+    if not resume:
+
+        return jsonify({
+            "success": False,
+            "message": "Please upload a resume."
+        }), 400
+
+    prompt = f"""
+You are StudentFix AI ResumeFix.
+
+Review a student's resume against the supplied job description.
+
+Give practical beginner-friendly feedback.
+
+Include:
+- strengths
+- missing skills
+- formatting improvements
+- project improvements
+- specific suggestions
+
+Do not invent facts about the student.
+
+JOB DESCRIPTION:
+{job[:12000]}
+
+Resume filename:
+{resume.filename}
+"""
+
+    ai_result = ask_ai(prompt)
+
+    result = (
+        ai_result
+        if ai_result
+        else fallback_resume(job)
+    )
+
+    save_record(
+        "ResumeFix",
+        result
+    )
+
+    return jsonify({
+        "success": True,
+        "result": result
+    })
+
+
+# =====================================================
+# CAREERMATE FALLBACK
+# =====================================================
+
+def fallback_career(
+    goal,
+    skills
+):
+
+    goal = goal.strip() or "Software Developer"
+
+    skills = skills.strip()
+
+    current = (
+        skills
+        if skills
+        else "Beginner level"
+    )
+
+    return f"""Career Roadmap
+
+Goal:
+{goal}
+
+Current skills:
+{current}
+
+Step 1 — Strengthen basics
+• Programming fundamentals
+• Problem solving
+• Git and GitHub
+• Basic SQL
+
+Step 2 — Build technical skills
+• Choose the main technologies required for {goal}
+• Practice small coding exercises
+• Learn through small projects
+
+Step 3 — Build projects
+• Create 2–3 practical projects
+• Put the projects on GitHub
+• Explain what you built and why
+
+Step 4 — Prepare for opportunities
+• Improve your resume
+• Practice technical questions
+• Practice communication and interview questions
+
+Step 5 — Keep improving
+• Review weak areas
+• Build another project
+• Follow current industry requirements
+
+Start with one skill at a time instead of trying to learn everything together."""
+
+
+# =====================================================
+# CAREERMATE
+# =====================================================
+
+@app.post("/careermate")
+def career_mate():
+
+    goal = request.form.get(
+        "goal",
+        ""
+    ).strip()
+
+    skills = request.form.get(
+        "skills",
+        ""
+    ).strip()
+
+    prompt = f"""
+You are StudentFix AI CareerMate.
+
+Create a beginner-friendly career roadmap.
+
+Career goal:
+{goal}
+
+Current skills:
+{skills}
+
+Include:
+1. Skills to learn
+2. Suggested project types
+3. Practice plan
+4. Resume preparation
+5. Interview preparation
+6. A simple sequence to follow
+
+Do not make unrealistic guarantees.
+"""
+
+    ai_result = ask_ai(prompt)
+
+    result = (
+        ai_result
+        if ai_result
+        else fallback_career(
+            goal,
+            skills
+        )
+    )
+
+    save_record(
+        "CareerMate",
+        result
+    )
+
+    return jsonify({
+        "success": True,
+        "result": result
+    })
+
+
+# =====================================================
+# INTERVIEW FALLBACK
+# =====================================================
+
+def fallback_question(role):
+
+    role = role.strip() or "Software Developer"
+
+    questions = {
+        "python": "Explain the difference between a list, tuple and dictionary in Python.",
+        "software": "Tell me about a project you have worked on and explain your contribution.",
+        "developer": "How would you approach solving a programming problem you have never seen before?",
+        "web": "Explain the difference between frontend and backend development."
+    }
+
+    lower = role.lower()
+
+    if "python" in lower:
+        return questions["python"]
+
+    if "web" in lower:
+        return questions["web"]
+
+    if "developer" in lower:
+        return questions["developer"]
+
+    return questions["software"]
+
+
+def fallback_eval(
+    question,
+    answer
+):
+
+    answer = answer.strip()
+
+    word_count = len(
+        answer.split()
+    )
+
+    if word_count < 10:
+
+        return """Interview feedback:
+
+Your answer is a little short.
+
+Try this structure:
+1. Direct answer
+2. Short explanation
+3. Example
+4. Result or conclusion
+
+Practice giving a clear answer in your own words."""
+
+    if word_count < 30:
+
+        return """Interview feedback:
+
+Your answer has a useful starting point.
+
+To improve it:
+• Give a little more explanation.
+• Add a practical example.
+• Clearly explain your own contribution.
+• Finish with the result or learning.
+
+Keep your answer natural rather than memorizing it."""
+
+    return """Interview feedback:
+
+Your answer contains enough detail for a basic interview response.
+
+To improve it further:
+• Start with the main point.
+• Use a specific example.
+• Explain your personal contribution.
+• Mention the result or what you learned.
+• Keep the answer focused on the question.
+
+Continue practicing with different questions."""
+
+
+# =====================================================
+# INTERVIEW QUESTION
+# =====================================================
+
+@app.post("/interview/question")
+def interview_question():
+
+    role = request.form.get(
+        "role",
+        "Software Developer"
+    ).strip()
+
+    if not role:
+        role = "Software Developer"
+
+    prompt = f"""
+You are StudentFix AI InterviewMate.
+
+Generate ONE beginner-friendly interview question
+for this target role:
+
+{role}
+
+Return only the question.
+"""
+
+    ai_result = ask_ai(prompt)
+
+    question = (
+        ai_result
+        if ai_result
+        else fallback_question(role)
+    )
+
+    return jsonify({
+        "success": True,
+        "question": question
+    })
+
+
+# =====================================================
+# INTERVIEW EVALUATION
+# =====================================================
+
+@app.post("/interview/evaluate")
+def interview_evaluate():
+
+    question = request.form.get(
+        "question",
+        ""
+    ).strip()
+
+    answer = request.form.get(
+        "answer",
+        ""
+    ).strip()
+
+    if not answer:
+
+        return jsonify({
+            "success": False,
+            "message": "Please type your answer first."
+        }), 400
+
+    prompt = f"""
+You are StudentFix AI InterviewMate.
+
+Evaluate this student's interview answer.
+
+Question:
+{question}
+
+Answer:
+{answer}
+
+Give beginner-friendly feedback.
+
+Include:
+- what was done well
+- what can improve
+- one specific suggestion
+
+Do not insult or discourage the student.
+"""
+
+    ai_result = ask_ai(prompt)
+
+    result = (
+        ai_result
+        if ai_result
+        else fallback_eval(
+            question,
+            answer
+        )
+    )
+
+    save_record(
+        "InterviewMate",
+        result
+    )
+
+    return jsonify({
+        "success": True,
+        "result": result
+    })
+
+
+# =====================================================
+# HISTORY
+# =====================================================
+
+@app.get("/history")
+def history():
+
+    user_id = current_user_id()
+
+    if user_id:
+
+        records = Record.query.filter_by(
+            user_id=user_id
+        ).order_by(
+            Record.id.desc()
+        ).limit(20).all()
+
+    else:
+
+        records = Record.query.filter_by(
+            user_id=None
+        ).order_by(
+            Record.id.desc()
+        ).limit(20).all()
+
+    return jsonify([
+        {
+            "module": record.module,
+            "result": record.result
+        }
+        for record in records
+    ])
+
+
+# =====================================================
+# HEALTH
+# =====================================================
+
+@app.get("/health")
+def health():
+
+    return jsonify({
+        "status": "ok",
+        "app": "StudentFix AI"
+    })
+
+
+# =====================================================
+# HOME
+# =====================================================
+
+@app.get("/")
+def home():
+
+    return render_template(
+        "index.html"
+    )
+
+
+# =====================================================
+# RUN
+# =====================================================
 
 if __name__ == "__main__":
-    app.run(debug=True, host="127.0.0.1", port=5000)
+
+    app.run(
+        host="127.0.0.1",
+        port=5000,
+        debug=False
+    )
